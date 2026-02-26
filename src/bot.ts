@@ -6,6 +6,12 @@ import { message } from 'telegraf/filters';
 import * as dotenv from 'dotenv';
 
 dotenv.config();
+console.log('=== ДИАГНОСТИКА: Все переменные окружения ===');
+console.log('BOT_TOKEN:', process.env.BOT_TOKEN);
+console.log('CHANNEL_ID:', process.env.CHANNEL_ID);
+console.log('MODERATION_GROUP_ID:', process.env.MODERATION_GROUP_ID);
+console.log('ADMIN_ID:', process.env.ADMIN_ID);
+console.log('============================================');
 
 // ========== Интерфейсы ==========
 interface SessionData {
