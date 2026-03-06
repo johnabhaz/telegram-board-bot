@@ -14,8 +14,11 @@ export class Ad {
   @Column({ nullable: true })
   photoFileId?: string;
 
-  @Column({ default: false })
-  published!: boolean;
+  @Column({ default: 'moderation' }) // moderation, approved, rejected
+  status!: string;
+
+  @Column({ nullable: true })
+  moderationMessageId?: number; // ID сообщения в группе модерации
 
   @CreateDateColumn()
   createdAt!: Date;

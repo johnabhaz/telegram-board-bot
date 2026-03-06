@@ -4,6 +4,8 @@ import { Ad } from './entities/Ad';
 import { Telegraf, Context, session, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import * as dotenv from 'dotenv';
+import { getRepository } from 'typeorm'; // если ещё не импортирован
+import { Ad } from './entities/Ad';
 
 dotenv.config();
 console.log('=== ДИАГНОСТИКА: Все переменные окружения ===');
@@ -103,6 +105,59 @@ async function sendToModeration(ctx: MyContext, text: string, photoFileId?: stri
 
 bot.start((ctx) => {
   ctx.reply('Бот работает! Используйте /add для подачи объявления.');
+});
+
+bot.command('myads', async (ctx) => {
+  const userId = ctx.from?.id;
+  if (!userId) {
+    return ctx.reply('Не удалось определить ваш ID');
+  }
+
+  try {
+    const adRepository = getRepository(Ad);
+    const ads = await adRepository.find({
+      where: { userId },
+      order: { createdAt: 'DESC' }
+    });
+
+    if (ads.length === 0) {
+      return ctx.reply('📭 У вас пока нет объявлений.');
+    }
+
+    let message = '📋 **Ваши объявления:**\n\n';
+    const statusEmoji = {
+      moderation: '⏳ На модерации',
+      approved: '✅ Опубликовано',
+      rejected: '❌ Отклонено'
+    };
+
+    for (let i = 0; i < ads.length; i++) {
+      const ad = ads[i];
+      const date = new Date(ad.createdAt).toLocaleString('ru-RU', {
+        day: '2-digit', month: '2-digit', year: 'numeric', hour: '2-digit', minute: '2-digit'
+      });
+      const status = statusEmoji[ad.status as keyof typeof statusEmoji] || '❓ Неизвестно';
+      const shortText = ad.text.length > 50 ? ad.text.substring(0, 47) + '…' : ad.text;
+      
+      message += `${i+1}. ${status}\n   📝 ${shortText}\n   🕒 ${date}\n`;
+      if (ad.photoFileId) message += `   📷 Есть фото\n`;
+      message += '\n';
+    }
+
+    // Telegram ограничивает длину сообщения 4096 символами
+    if (message.length > 4096) {
+      // Разбиваем на части
+      const parts = message.match(/(.|[\r\n]){1,4096}/g) || [];
+      for (const part of parts) {
+        await ctx.reply(part, { parse_mode: 'Markdown' });
+      }
+    } else {
+      await ctx.reply(message, { parse_mode: 'Markdown' });
+    }
+  } catch (error) {
+    console.error('Ошибка в /myads:', error);
+    await ctx.reply('❌ Произошла ошибка при получении списка объявлений.');
+  }
 });
 
 bot.command('add', (ctx) => {
