@@ -4,8 +4,8 @@ import { Ad } from './entities/Ad';
 import { Telegraf, Context, session, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import * as dotenv from 'dotenv';
-import { getRepository } from 'typeorm'; // если ещё не импортирован
-import { Ad } from './entities/Ad';
+//import { getRepository } from 'typeorm'; // если ещё не импортирован
+//import { Ad } from './entities/Ad';
 
 dotenv.config();
 console.log('=== ДИАГНОСТИКА: Все переменные окружения ===');
@@ -62,16 +62,15 @@ async function publishAd(ctx: MyContext, text: string, photoFileId?: string) {
 async function sendToModeration(ctx: MyContext, text: string, photoFileId?: string) {
   const modGroupId = process.env.MODERATION_GROUP_ID;
 
-  // Сохраняем объявление в БД (если используете)
+  // Сначала создаём и сохраняем объявление в БД (это уже есть в вашем коде)
   const adRepository = getRepository(Ad);
   const ad = new Ad();
   ad.userId = ctx.from!.id;
   ad.text = text;
   ad.photoFileId = photoFileId;
-  ad.published = false;
+  ad.status = 'moderation';
   await adRepository.save(ad);
 
-  // Если группа модерации не задана – публикуем сразу
   if (!modGroupId) {
     return publishAd(ctx, text, photoFileId);
   }
@@ -84,16 +83,25 @@ async function sendToModeration(ctx: MyContext, text: string, photoFileId?: stri
 
   const caption = `📬 Новое объявление от @${ctx.from?.username || 'пользователь'} (ID: ${userId}):\n\n${text}`;
   const keyboard = Markup.inlineKeyboard([
-    Markup.button.callback('✅ Одобрить', `approve_${userId}`),
-    Markup.button.callback('❌ Отклонить', `reject_${userId}`)
+    Markup.button.callback('✅ Одобрить', `approve_${ad.id}`),   // ← теперь передаём id объявления
+    Markup.button.callback('❌ Отклонить', `reject_${ad.id}`)
   ]);
 
   try {
+    let sentMessage;
     if (photoFileId) {
-      await bot.telegram.sendPhoto(modGroupId, photoFileId, { caption, ...keyboard });
+      sentMessage = await bot.telegram.sendPhoto(modGroupId, photoFileId, {
+        caption,
+        ...keyboard
+      });
     } else {
-      await bot.telegram.sendMessage(modGroupId, caption, keyboard);
+      sentMessage = await bot.telegram.sendMessage(modGroupId, caption, keyboard);
     }
+
+    // Сохраняем ID сообщения в БД
+    ad.moderationMessageId = sentMessage.message_id;
+    await adRepository.save(ad);
+
     await ctx.reply('📨 Ваше объявление отправлено на модерацию. Мы уведомим вас о результате.');
   } catch (err) {
     console.error('Ошибка отправки в группу модерации:', err);
@@ -231,9 +239,9 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
   const callbackData = ctx.callbackQuery.data;
-  const [action, userIdStr] = callbackData.split('_');
-  const userId = parseInt(userIdStr, 10);
-  if (isNaN(userId)) {
+  const [action, adIdStr] = callbackData.split('_');
+  const adId = parseInt(adIdStr, 10);
+  if (isNaN(adId)) {
     await ctx.answerCbQuery('Ошибка данных');
     return;
   }
@@ -244,39 +252,43 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
-  // Извлекаем текст и фото
-  let text = '';
-  let photoFileId: string | undefined;
-
-  if ('caption' in message && message.caption) {
-    text = message.caption.replace(/^📬 Новое объявление от @[^:]+:\n\n/, '');
-  } else if ('text' in message && message.text) {
-    text = message.text.replace(/^📬 Новое объявление от @[^:]+:\n\n/, '');
-  }
-
-  if ('photo' in message && message.photo) {
-    photoFileId = message.photo[message.photo.length - 1].file_id;
-  }
-
   try {
+    const adRepository = getRepository(Ad);
+    const ad = await adRepository.findOne({ where: { id: adId } });
+    if (!ad) {
+      await ctx.answerCbQuery('Объявление не найдено');
+      return;
+    }
+
     if (action === 'approve') {
+      // Публикуем в канал
       const channelId = process.env.CHANNEL_ID;
       if (!channelId) throw new Error('CHANNEL_ID не задан');
 
-      if (photoFileId) {
-        await bot.telegram.sendPhoto(channelId, photoFileId, { caption: text });
+      if (ad.photoFileId) {
+        await bot.telegram.sendPhoto(channelId, ad.photoFileId, { caption: ad.text });
       } else {
-        await bot.telegram.sendMessage(channelId, text);
+        await bot.telegram.sendMessage(channelId, ad.text);
       }
-      await bot.telegram.sendMessage(userId, '✅ Ваше объявление одобрено и опубликовано!');
 
+      // Обновляем статус
+      ad.status = 'approved';
+      await adRepository.save(ad);
+
+      // Уведомляем пользователя
+      await bot.telegram.sendMessage(ad.userId, '✅ Ваше объявление одобрено и опубликовано!');
+
+      // Редактируем сообщение в группе модерации
       if ('caption' in message) {
         await ctx.editMessageCaption('✅ Одобрено');
       } else {
         await ctx.editMessageText('✅ Одобрено');
       }
     } else if (action === 'reject') {
-      await bot.telegram.sendMessage(userId, '❌ Ваше объявление отклонено модератором.');
+      ad.status = 'rejected';
+      await adRepository.save(ad);
+
+      await bot.telegram.sendMessage(ad.userId, '❌ Ваше объявление отклонено модератором.');
 
       if ('caption' in message) {
         await ctx.editMessageCaption('❌ Отклонено');
@@ -284,12 +296,12 @@ bot.on('callback_query', async (ctx) => {
         await ctx.editMessageText('❌ Отклонено');
       }
     }
+
+    await ctx.answerCbQuery(); // убираем "часики" на кнопке
   } catch (err) {
     console.error('Ошибка обработки модерации:', err);
     await ctx.answerCbQuery('Произошла ошибка');
   }
-
-  await ctx.answerCbQuery();
 });
 
 // ========== Подключение к БД и ЗАПУСК (единственный) ==========
