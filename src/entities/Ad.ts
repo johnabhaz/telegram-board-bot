@@ -1,4 +1,5 @@
-import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn } from 'typeorm';
+import { Entity, PrimaryGeneratedColumn, Column, CreateDateColumn, ManyToOne, JoinColumn } from 'typeorm';
+import { Category } from './Category';
 
 @Entity()
 export class Ad {
@@ -14,11 +15,19 @@ export class Ad {
   @Column({ nullable: true })
   photoFileId?: string;
 
-  @Column({ default: 'moderation' }) // moderation, approved, rejected
+  @Column({ default: 'moderation' })
   status!: string;
 
   @Column({ nullable: true })
-  moderationMessageId?: number; // ID сообщения в группе модерации
+  moderationMessageId?: number;
+
+  // Связь с категорией
+  @ManyToOne(() => Category, category => category.ads)
+  @JoinColumn({ name: 'categoryId' })
+  category!: Category;
+
+  @Column({ nullable: true })
+  categoryId?: number; // внешний ключ
 
   @CreateDateColumn()
   createdAt!: Date;

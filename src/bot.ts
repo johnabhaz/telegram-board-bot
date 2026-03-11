@@ -1,11 +1,10 @@
 import 'reflect-metadata';
 import { createConnection, getRepository } from 'typeorm';
 import { Ad } from './entities/Ad';
+import { Category } from './entities/Category';
 import { Telegraf, Context, session, Markup } from 'telegraf';
 import { message } from 'telegraf/filters';
 import * as dotenv from 'dotenv';
-//import { getRepository } from 'typeorm'; // если ещё не импортирован
-//import { Ad } from './entities/Ad';
 
 dotenv.config();
 console.log('=== ДИАГНОСТИКА: Все переменные окружения ===');
@@ -17,8 +16,9 @@ console.log('============================================');
 
 // ========== Интерфейсы ==========
 interface SessionData {
-  step?: 'idle' | 'awaiting_text' | 'awaiting_photo';
+  step?: 'idle' | 'awaiting_category' | 'awaiting_text' | 'awaiting_photo';
   adText?: string;
+  categoryId?: number;
 }
 
 interface MyContext extends Context {
@@ -58,32 +58,47 @@ async function publishAd(ctx: MyContext, text: string, photoFileId?: string) {
   }
 }
 
-// Отправка на модерацию
-async function sendToModeration(ctx: MyContext, text: string, photoFileId?: string) {
+// Отправка на модерацию (с поддержкой категорий)
+async function sendToModeration(ctx: MyContext, text: string, categoryId: number, photoFileId?: string) {
   const modGroupId = process.env.MODERATION_GROUP_ID;
-
-  // Сначала создаём и сохраняем объявление в БД (это уже есть в вашем коде)
-  const adRepository = getRepository(Ad);
-  const ad = new Ad();
-  ad.userId = ctx.from!.id;
-  ad.text = text;
-  ad.photoFileId = photoFileId;
-  ad.status = 'moderation';
-  await adRepository.save(ad);
-
-  if (!modGroupId) {
-    return publishAd(ctx, text, photoFileId);
-  }
-
   const userId = ctx.from?.id;
   if (!userId) {
     await ctx.reply('Ошибка: не удалось определить ваш ID');
     return;
   }
 
-  const caption = `📬 Новое объявление от @${ctx.from?.username || 'пользователь'} (ID: ${userId}):\n\n${text}`;
+  // Если модерация отключена, публикуем сразу и не сохраняем в БД (или сохраняем как approved)
+  if (!modGroupId) {
+    // Можно сохранить как approved, если нужно хранить историю
+    const adRepository = getRepository(Ad);
+    const ad = new Ad();
+    ad.userId = userId;
+    ad.text = text;
+    ad.photoFileId = photoFileId;
+    ad.status = 'approved';
+    ad.categoryId = categoryId;
+    await adRepository.save(ad);
+    return publishAd(ctx, text, photoFileId);
+  }
+
+  // Получаем название категории для сообщения модераторам
+  const categoryRepository = getRepository(Category);
+  const category = await categoryRepository.findOne({ where: { id: categoryId } });
+  const categoryName = category ? category.name : 'без категории';
+
+  // Создаём объявление в БД со статусом moderation
+  const adRepository = getRepository(Ad);
+  const ad = new Ad();
+  ad.userId = userId;
+  ad.text = text;
+  ad.photoFileId = photoFileId;
+  ad.status = 'moderation';
+  ad.categoryId = categoryId;
+  await adRepository.save(ad);
+
+  const caption = `📬 Новое объявление от @${ctx.from?.username || 'пользователь'} (ID: ${userId})\n🏷️ Категория: ${categoryName}\n\n${text}`;
   const keyboard = Markup.inlineKeyboard([
-    Markup.button.callback('✅ Одобрить', `approve_${ad.id}`),   // ← теперь передаём id объявления
+    Markup.button.callback('✅ Одобрить', `approve_${ad.id}`),
     Markup.button.callback('❌ Отклонить', `reject_${ad.id}`)
   ]);
 
@@ -125,7 +140,8 @@ bot.command('myads', async (ctx) => {
     const adRepository = getRepository(Ad);
     const ads = await adRepository.find({
       where: { userId },
-      order: { createdAt: 'DESC' }
+      order: { createdAt: 'DESC' },
+      relations: ['category'] // ← запятая добавлена
     });
 
     if (ads.length === 0) {
@@ -146,15 +162,14 @@ bot.command('myads', async (ctx) => {
       });
       const status = statusEmoji[ad.status as keyof typeof statusEmoji] || '❓ Неизвестно';
       const shortText = ad.text.length > 50 ? ad.text.substring(0, 47) + '…' : ad.text;
-      
-      message += `${i+1}. ${status}\n   📝 ${shortText}\n   🕒 ${date}\n`;
+      const categoryName = ad.category ? ad.category.name : 'Без категории';
+
+      message += `${i + 1}. ${status}\n   📝 ${shortText}\n   🏷️ Категория: ${categoryName}\n   🕒 ${date}\n`;
       if (ad.photoFileId) message += `   📷 Есть фото\n`;
       message += '\n';
     }
 
-    // Telegram ограничивает длину сообщения 4096 символами
     if (message.length > 4096) {
-      // Разбиваем на части
       const parts = message.match(/(.|[\r\n]){1,4096}/g) || [];
       for (const part of parts) {
         await ctx.reply(part, { parse_mode: 'Markdown' });
@@ -168,9 +183,20 @@ bot.command('myads', async (ctx) => {
   }
 });
 
-bot.command('add', (ctx) => {
-  ctx.session.step = 'awaiting_text';
-  ctx.reply('Отправьте текст вашего объявления:');
+bot.command('add', async (ctx) => {
+  const categoryRepository = getRepository(Category);
+  const categories = await categoryRepository.find();
+  if (categories.length === 0) {
+    return ctx.reply('❌ Категории временно недоступны. Попробуйте позже.');
+  }
+
+  const buttons = categories.map(cat =>
+    Markup.button.callback(cat.name, `cat_${cat.id}`)
+  );
+  const keyboard = Markup.inlineKeyboard(buttons, { columns: 2 });
+
+  await ctx.reply('📂 Выберите категорию:', keyboard);
+  ctx.session.step = 'awaiting_category';
 });
 
 bot.command('test_channel', async (ctx) => {
@@ -208,9 +234,10 @@ bot.on(message('text'), async (ctx) => {
       break;
     case 'awaiting_photo':
       if (ctx.message.text.toLowerCase() === 'пропустить') {
-        await sendToModeration(ctx, ctx.session.adText!);
+        await sendToModeration(ctx, ctx.session.adText!, ctx.session.categoryId!);
         ctx.session.step = 'idle';
         ctx.session.adText = undefined;
+        ctx.session.categoryId = undefined;
       } else {
         await ctx.reply('Пожалуйста, отправьте фото или напишите "пропустить"');
       }
@@ -221,25 +248,44 @@ bot.on(message('text'), async (ctx) => {
 });
 
 bot.on(message('photo'), async (ctx) => {
-  if (ctx.session.step === 'awaiting_photo' && ctx.session.adText) {
+  if (ctx.session.step === 'awaiting_photo' && ctx.session.adText && ctx.session.categoryId) {
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
-    await sendToModeration(ctx, ctx.session.adText, photo.file_id);
+    await sendToModeration(ctx, ctx.session.adText, ctx.session.categoryId, photo.file_id);
     ctx.session.step = 'idle';
     ctx.session.adText = undefined;
+    ctx.session.categoryId = undefined;
   } else {
     await ctx.reply('Сначала начните добавление через /add');
   }
 });
 
-// ========== Обработка нажатий на кнопки модерации ==========
+// ========== Обработка нажатий на кнопки (категории и модерация) ==========
 
 bot.on('callback_query', async (ctx) => {
   if (!('data' in ctx.callbackQuery)) {
     await ctx.answerCbQuery('Это не кнопка с данными');
     return;
   }
-  const callbackData = ctx.callbackQuery.data;
-  const [action, adIdStr] = callbackData.split('_');
+  const data = ctx.callbackQuery.data;
+
+  // === Обработка выбора категории ===
+  if (data.startsWith('cat_')) {
+    const categoryId = parseInt(data.split('_')[1], 10);
+    if (isNaN(categoryId)) {
+      await ctx.answerCbQuery('Ошибка: некорректная категория');
+      return;
+    }
+
+    ctx.session.categoryId = categoryId;
+    ctx.session.step = 'awaiting_text';
+
+    await ctx.editMessageText('✅ Категория выбрана. Теперь отправьте текст объявления:');
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  // === Обработка модерации (approve/reject) ===
+  const [action, adIdStr] = data.split('_');
   const adId = parseInt(adIdStr, 10);
   if (isNaN(adId)) {
     await ctx.answerCbQuery('Ошибка данных');
@@ -271,14 +317,11 @@ bot.on('callback_query', async (ctx) => {
         await bot.telegram.sendMessage(channelId, ad.text);
       }
 
-      // Обновляем статус
       ad.status = 'approved';
       await adRepository.save(ad);
 
-      // Уведомляем пользователя
       await bot.telegram.sendMessage(ad.userId, '✅ Ваше объявление одобрено и опубликовано!');
 
-      // Редактируем сообщение в группе модерации
       if ('caption' in message) {
         await ctx.editMessageCaption('✅ Одобрено');
       } else {
@@ -297,27 +340,42 @@ bot.on('callback_query', async (ctx) => {
       }
     }
 
-    await ctx.answerCbQuery(); // убираем "часики" на кнопке
+    await ctx.answerCbQuery();
   } catch (err) {
     console.error('Ошибка обработки модерации:', err);
     await ctx.answerCbQuery('Произошла ошибка');
   }
 });
 
-// ========== Подключение к БД и ЗАПУСК (единственный) ==========
+// ========== Подключение к БД и ЗАПУСК ==========
 
 createConnection({
   type: 'sqlite',
   database: 'database.sqlite',
-  entities: [Ad],
+  entities: [Ad, Category],
   synchronize: true,
   logging: false
 })
   .then(async connection => {
-  console.log('База данных подключена');
-  console.log('✅ Бот успешно запущен и слушает сообщения');
-  await bot.launch();
-})
+    console.log('База данных подключена');
+
+    const categoryRepository = getRepository(Category);
+    const count = await categoryRepository.count();
+    if (count === 0) {
+      const defaultCategories = ['Недвижимость', 'Транспорт', 'Работа', 'Услуги', 'Электроника', 'Прочее'];
+      for (const name of defaultCategories) {
+        const cat = new Category();
+        cat.name = name;
+        await categoryRepository.save(cat);
+      }
+      console.log('✅ Категории по умолчанию созданы');
+    } else {
+      console.log(`📊 В базе уже есть ${count} категорий`);
+    }
+
+    console.log('✅ Бот успешно запущен и слушает сообщения');
+    await bot.launch();
+  })
   .catch(error => console.log('Ошибка БД:', error));
 
 // ========== Корректное завершение ==========
