@@ -355,8 +355,10 @@ bot.on('callback_query', async (ctx) => {
 // ========== НОВЫЙ ОБРАБОТЧИК: данные из WebApp ==========
 
 bot.on('message', async (ctx) => {
-  if (ctx.message?.web_app_data) {
-    const data = JSON.parse(ctx.message.web_app_data.data);
+  // Проверяем наличие поля web_app_data через оператор in
+  if (ctx.message && 'web_app_data' in ctx.message) {
+    const webAppData = (ctx.message as any).web_app_data; // или использовать any
+    const data = JSON.parse(webAppData.data);
     
     // Обработка просмотра объявления
     if (data.action === 'viewAd') {
