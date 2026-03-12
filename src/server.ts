@@ -82,4 +82,8 @@ createConnection({
   app.listen(PORT, () => {
     console.log(`🌐 API сервер запущен на порту ${PORT}`);
   });
-}).catch(error => console.log('Ошибка API:', error));
+}).catch(error => {
+  console.error('❌ Ошибка подключения к базе данных:');
+  console.error(error);
+  process.exit(1); // Принудительно завершаем процесс, чтобы Railway показал ошибку
+});
