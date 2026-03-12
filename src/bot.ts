@@ -69,7 +69,6 @@ async function sendToModeration(ctx: MyContext, text: string, categoryId: number
 
   // Если модерация отключена, публикуем сразу и не сохраняем в БД (или сохраняем как approved)
   if (!modGroupId) {
-    // Можно сохранить как approved, если нужно хранить историю
     const adRepository = getRepository(Ad);
     const ad = new Ad();
     ad.userId = userId;
@@ -81,12 +80,10 @@ async function sendToModeration(ctx: MyContext, text: string, categoryId: number
     return publishAd(ctx, text, photoFileId);
   }
 
-  // Получаем название категории для сообщения модераторам
   const categoryRepository = getRepository(Category);
   const category = await categoryRepository.findOne({ where: { id: categoryId } });
   const categoryName = category ? category.name : 'без категории';
 
-  // Создаём объявление в БД со статусом moderation
   const adRepository = getRepository(Ad);
   const ad = new Ad();
   ad.userId = userId;
@@ -113,7 +110,6 @@ async function sendToModeration(ctx: MyContext, text: string, categoryId: number
       sentMessage = await bot.telegram.sendMessage(modGroupId, caption, keyboard);
     }
 
-    // Сохраняем ID сообщения в БД
     ad.moderationMessageId = sentMessage.message_id;
     await adRepository.save(ad);
 
@@ -141,7 +137,7 @@ bot.command('myads', async (ctx) => {
     const ads = await adRepository.find({
       where: { userId },
       order: { createdAt: 'DESC' },
-      relations: ['category'] // ← запятая добавлена
+      relations: ['category']
     });
 
     if (ads.length === 0) {
@@ -197,6 +193,16 @@ bot.command('add', async (ctx) => {
 
   await ctx.reply('📂 Выберите категорию:', keyboard);
   ctx.session.step = 'awaiting_category';
+});
+
+bot.command('webapp', (ctx) => {
+  ctx.reply('Открыть доску объявлений', {
+    reply_markup: {
+      inline_keyboard: [
+        [{ text: '📱 Открыть приложение', web_app: { url: 'https://johnabhaz.github.io/telegram-board-webapp/' } }]
+      ]
+    }
+  });
 });
 
 bot.command('test_channel', async (ctx) => {
@@ -268,7 +274,7 @@ bot.on('callback_query', async (ctx) => {
   }
   const data = ctx.callbackQuery.data;
 
-  // === Обработка выбора категории ===
+  // Обработка выбора категории
   if (data.startsWith('cat_')) {
     const categoryId = parseInt(data.split('_')[1], 10);
     if (isNaN(categoryId)) {
@@ -284,7 +290,7 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
-  // === Обработка модерации (approve/reject) ===
+  // Обработка модерации (approve/reject)
   const [action, adIdStr] = data.split('_');
   const adId = parseInt(adIdStr, 10);
   if (isNaN(adId)) {
@@ -307,7 +313,6 @@ bot.on('callback_query', async (ctx) => {
     }
 
     if (action === 'approve') {
-      // Публикуем в канал
       const channelId = process.env.CHANNEL_ID;
       if (!channelId) throw new Error('CHANNEL_ID не задан');
 
@@ -344,6 +349,60 @@ bot.on('callback_query', async (ctx) => {
   } catch (err) {
     console.error('Ошибка обработки модерации:', err);
     await ctx.answerCbQuery('Произошла ошибка');
+  }
+});
+
+// ========== НОВЫЙ ОБРАБОТЧИК: данные из WebApp ==========
+
+bot.on('message', async (ctx) => {
+  if (ctx.message?.web_app_data) {
+    const data = JSON.parse(ctx.message.web_app_data.data);
+    
+    // Обработка просмотра объявления
+    if (data.action === 'viewAd') {
+      const adId = data.adId;
+      const adRepository = getRepository(Ad);
+      const ad = await adRepository.findOne({ 
+        where: { id: adId },
+        relations: ['category'] 
+      });
+      
+      if (!ad) {
+        await ctx.reply('❌ Объявление не найдено');
+        return;
+      }
+      
+      let message = `📌 **Объявление #${ad.id}**\n\n${ad.text}`;
+      if (ad.category) message += `\n🏷️ Категория: ${ad.category.name}`;
+      message += `\n📅 ${new Date(ad.createdAt).toLocaleString('ru-RU')}`;
+      message += `\n📊 Статус: ${
+        ad.status === 'approved' ? '✅ Опубликовано' : 
+        ad.status === 'moderation' ? '⏳ На модерации' : 
+        ad.status === 'rejected' ? '❌ Отклонено' : '❓ Неизвестно'
+      }`;
+      
+      if (ad.photoFileId) {
+        await ctx.replyWithPhoto(ad.photoFileId, { caption: message, parse_mode: 'Markdown' });
+      } else {
+        await ctx.reply(message, { parse_mode: 'Markdown' });
+      }
+    } 
+    // Обработка создания объявления
+    else if (data.action === 'createAd') {
+      const { categoryId, text } = data;
+      
+      if (!categoryId || !text) {
+        await ctx.reply('❌ Ошибка: не все данные получены');
+        return;
+      }
+      
+      // Сохраняем в сессию, переходим к шагу ожидания фото
+      ctx.session.categoryId = categoryId;
+      ctx.session.adText = text;
+      ctx.session.step = 'awaiting_photo';
+      
+      await ctx.reply('✅ Текст объявления получен. Теперь отправьте фото (или напишите "пропустить")');
+    }
   }
 });
 
