@@ -1,3 +1,4 @@
+console.error('=== start.js: НАЧАЛО ===');
 const { fork } = require('child_process');
 const path = require('path');
 
