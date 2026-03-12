@@ -1,4 +1,3 @@
-console.log('🚀 server.ts запущен');
 import express from 'express';
 import cors from 'cors';
 import { createConnection, getRepository } from 'typeorm';
@@ -8,15 +7,23 @@ import { Category } from './entities/Category';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(cors());
+app.use(cors({
+  origin: 'https://johnabhaz.github.io' // укажите ваш домен
+}));
 app.use(express.json());
 
 createConnection({
   type: 'sqlite',
   database: 'database.sqlite',
   entities: [Ad, Category],
-  synchronize: true,
-  logging: false
+  synchronize: false, // ОТКЛЮЧАЕМ синхронизацию – таблицы уже созданы ботом
+  logging: false,
+  extra: {
+    pragma: {
+      journal_mode: 'WAL',     // Write-Ahead Logging для конкурентного доступа
+      synchronous: 'NORMAL',    // Баланс скорости и надёжности
+    }
+  }
 }).then(() => {
   console.log('📦 API: база данных подключена');
 

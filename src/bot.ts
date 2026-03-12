@@ -414,8 +414,14 @@ createConnection({
   type: 'sqlite',
   database: 'database.sqlite',
   entities: [Ad, Category],
-  synchronize: true,
-  logging: false
+  synchronize: true,  // оставляем true – бот создаёт таблицы
+  logging: false,
+  extra: {
+    pragma: {
+      journal_mode: 'WAL',
+      synchronous: 'NORMAL',
+    }
+  }
 })
   .then(async connection => {
     console.log('База данных подключена');
