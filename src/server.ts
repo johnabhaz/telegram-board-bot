@@ -7,21 +7,32 @@ import { Category } from './entities/Category';
 const app = express();
 const PORT = process.env.PORT || 3000;
 
+// Middleware для логирования всех входящих запросов
+app.use((req, res, next) => {
+  console.log(`📨 ${req.method} ${req.url}`);
+  next();
+});
+
 app.use(cors({
-  origin: 'https://johnabhaz.github.io' // укажите ваш домен
+  origin: 'https://johnabhaz.github.io' // разрешаем запросы с вашего WebApp
 }));
 app.use(express.json());
+
+// Простой тестовый маршрут для проверки доступности API
+app.get('/test', (req, res) => {
+  res.json({ status: 'ok', message: 'API работает' });
+});
 
 createConnection({
   type: 'sqlite',
   database: 'database.sqlite',
   entities: [Ad, Category],
-  synchronize: false, // ОТКЛЮЧАЕМ синхронизацию – таблицы уже созданы ботом
+  synchronize: false, // таблицы создаются ботом, отключаем синхронизацию
   logging: false,
   extra: {
     pragma: {
-      journal_mode: 'WAL',     // Write-Ahead Logging для конкурентного доступа
-      synchronous: 'NORMAL',    // Баланс скорости и надёжности
+      journal_mode: 'WAL',     // WAL для конкурентного доступа
+      synchronous: 'NORMAL',    // баланс скорости и надёжности
     }
   }
 }).then(() => {
