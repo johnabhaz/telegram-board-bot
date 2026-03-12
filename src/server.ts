@@ -18,9 +18,14 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Простой тестовый маршрут для проверки доступности API
+// Простой тестовый маршрут для проверки доступности API (с try-catch)
 app.get('/test', (req, res) => {
-  res.json({ status: 'ok', message: 'API работает' });
+  try {
+    res.json({ status: 'ok', message: 'API работает' });
+  } catch (err) {
+    console.error('❌ Ошибка в /test:', err);
+    res.status(500).json({ error: 'Внутренняя ошибка сервера' });
+  }
 });
 
 createConnection({
@@ -38,50 +43,69 @@ createConnection({
 }).then(() => {
   console.log('📦 API: база данных подключена');
 
+  // Маршрут для получения категорий (с try-catch)
   app.get('/api/categories', async (req, res) => {
-    const categoryRepo = getRepository(Category);
-    const categories = await categoryRepo.find();
-    res.json(categories);
+    try {
+      const categoryRepo = getRepository(Category);
+      const categories = await categoryRepo.find();
+      res.json(categories);
+    } catch (err) {
+      console.error('❌ Ошибка в /api/categories:', err);
+      res.status(500).json({ error: 'Ошибка при получении категорий' });
+    }
   });
 
+  // Маршрут для получения объявлений (с try-catch)
   app.get('/api/ads', async (req, res) => {
-    const { page = 1, limit = 10, categoryId, search } = req.query;
-    const adRepo = getRepository(Ad);
-    const query = adRepo.createQueryBuilder('ad')
-      .leftJoinAndSelect('ad.category', 'category')
-      .where('ad.status = :status', { status: 'approved' })
-      .orderBy('ad.createdAt', 'DESC');
+    try {
+      const { page = 1, limit = 10, categoryId, search } = req.query;
+      const adRepo = getRepository(Ad);
+      const query = adRepo.createQueryBuilder('ad')
+        .leftJoinAndSelect('ad.category', 'category')
+        .where('ad.status = :status', { status: 'approved' })
+        .orderBy('ad.createdAt', 'DESC');
 
-    if (categoryId) {
-      query.andWhere('ad.categoryId = :categoryId', { categoryId: Number(categoryId) });
+      if (categoryId) {
+        query.andWhere('ad.categoryId = :categoryId', { categoryId: Number(categoryId) });
+      }
+      if (search) {
+        query.andWhere('ad.text LIKE :search', { search: `%${search}%` });
+      }
+
+      const total = await query.getCount();
+      const ads = await query
+        .skip((Number(page) - 1) * Number(limit))
+        .take(Number(limit))
+        .getMany();
+
+      res.json({
+        ads: ads.map(ad => ({
+          id: ad.id,
+          text: ad.text,
+          photoFileId: ad.photoFileId,
+          category: ad.category ? ad.category.name : null,
+          createdAt: ad.createdAt,
+        })),
+        total,
+        page: Number(page),
+        totalPages: Math.ceil(total / Number(limit))
+      });
+    } catch (err) {
+      console.error('❌ Ошибка в /api/ads:', err);
+      res.status(500).json({ error: 'Ошибка при получении объявлений' });
     }
-    if (search) {
-      query.andWhere('ad.text LIKE :search', { search: `%${search}%` });
-    }
-
-    const total = await query.getCount();
-    const ads = await query
-      .skip((Number(page) - 1) * Number(limit))
-      .take(Number(limit))
-      .getMany();
-
-    res.json({
-      ads: ads.map(ad => ({
-        id: ad.id,
-        text: ad.text,
-        photoFileId: ad.photoFileId,
-        category: ad.category ? ad.category.name : null,
-        createdAt: ad.createdAt,
-      })),
-      total,
-      page: Number(page),
-      totalPages: Math.ceil(total / Number(limit))
-    });
   });
 
-  app.listen(PORT, () => {
+  // Запускаем сервер с явным указанием интерфейса 0.0.0.0
+  const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 API сервер запущен на порту ${PORT}`);
   });
+
+  // Обработка ошибок сервера
+  server.on('error', (err) => {
+    console.error('❌ Ошибка сервера:', err);
+  });
+
 }).catch(error => {
   console.error('❌ Ошибка подключения к базе данных:');
   console.error(error);
