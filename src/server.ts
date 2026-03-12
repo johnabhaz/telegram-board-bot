@@ -1,3 +1,4 @@
+console.log('🚀 server.ts запущен');
 import express from 'express';
 import cors from 'cors';
 import { createConnection, getRepository } from 'typeorm';
