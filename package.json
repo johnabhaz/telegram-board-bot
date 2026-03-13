@@ -3,12 +3,12 @@
   "version": "1.0.0",
   "description": "",
   "main": "dist/bot.js",
-"scripts": {
-  "build": "tsc",
-  "start": "node start.js",
-  "dev": "concurrently \"nodemon src/bot.ts\" \"nodemon src/server.ts\"",
-  "test": "echo \"Error: no test specified\" && exit 1"
-},
+  "scripts": {
+    "build": "tsc",
+    "start": "node start.js",
+    "dev": "concurrently \"nodemon src/bot.ts\" \"nodemon src/server.ts\"",
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
   "keywords": [],
   "author": "",
   "license": "ISC",
@@ -18,14 +18,16 @@
     "cors": "^2.8.6",
     "dotenv": "^17.3.1",
     "express": "^5.2.1",
+    "multer": "^2.1.1",
     "reflect-metadata": "^0.2.2",
     "sqlite3": "^5.1.7",
     "telegraf": "^4.16.3",
-    "typeorm": "^0.3.28"
+    "typeorm": "^0.3.6"
   },
   "devDependencies": {
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
+    "@types/multer": "^2.1.0",
     "@types/node": "^25.3.0",
     "concurrently": "^9.2.1",
     "nodemon": "^3.1.14",
