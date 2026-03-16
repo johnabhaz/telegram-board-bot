@@ -3,7 +3,7 @@ import { createConnection, getRepository } from 'typeorm';
 import { Ad } from './entities/Ad';
 import { Category } from './entities/Category';
 import { Telegraf, Context, session, Markup } from 'telegraf';
-import { message } from 'telegraf/filters';
+import { message as tgMessage } from 'telegraf/filters'; // переименовываем импорт, чтобы избежать конфликта имён
 import * as dotenv from 'dotenv';
 
 dotenv.config();
@@ -30,6 +30,7 @@ interface SessionData {
   step?: 'idle' | 'awaiting_category' | 'awaiting_text' | 'awaiting_photo';
   adText?: string;
   categoryId?: number;
+  accumulatorMediaGroupId?: string; // ID текущего альбома
 }
 
 interface MyContext extends Context {
@@ -49,7 +50,7 @@ bot.use(session({ defaultSession: (): SessionData => ({ step: 'idle' }) }));
 // ========== Функции ==========
 
 // Прямая публикация
-async function publishAd(ctx: MyContext, text: string, photoFileIds?: string[], singlePhotoId?: string) {
+async function publishAd(ctx: MyContext, text: string, photoFileIds?: string[]) {
   const channelId = process.env.CHANNEL_ID;
   if (!channelId) {
     await ctx.reply('❌ Ошибка: канал не настроен (CHANNEL_ID отсутствует)');
@@ -63,8 +64,6 @@ async function publishAd(ctx: MyContext, text: string, photoFileIds?: string[], 
         ...(index === 0 ? { caption: text } : {}),
       }));
       await bot.telegram.sendMediaGroup(channelId, mediaGroup);
-    } else if (singlePhotoId) {
-      await bot.telegram.sendPhoto(channelId, singlePhotoId, { caption: text });
     } else {
       await bot.telegram.sendMessage(channelId, text);
     }
@@ -93,7 +92,7 @@ async function sendToModeration(ctx: MyContext, text: string, categoryId: number
     ad.status = 'approved';
     ad.categoryId = categoryId;
     await adRepository.save(ad);
-    return publishAd(ctx, text, photoFileId ? [photoFileId] : undefined, photoFileId);
+    return publishAd(ctx, text, photoFileId ? [photoFileId] : []);
   }
 
   const categoryRepository = getRepository(Category);
@@ -275,6 +274,12 @@ bot.command('myads', async (ctx) => {
 });
 
 bot.command('add', async (ctx) => {
+  // Очищаем старый аккумулятор, если был
+  if (ctx.session.accumulatorMediaGroupId) {
+    delete photoAccumulators[ctx.session.accumulatorMediaGroupId];
+    ctx.session.accumulatorMediaGroupId = undefined;
+  }
+
   const categoryRepository = getRepository(Category);
   const categories = await categoryRepository.find();
   if (categories.length === 0) {
@@ -324,7 +329,7 @@ bot.command('test_channel', async (ctx) => {
 
 // ========== Обработчики сообщений ==========
 
-bot.on(message('text'), async (ctx) => {
+bot.on(tgMessage('text'), async (ctx) => {
   if (ctx.message.text.startsWith('/')) return;
 
   switch (ctx.session.step) {
@@ -348,7 +353,7 @@ bot.on(message('text'), async (ctx) => {
   }
 });
 
-bot.on(message('photo'), async (ctx) => {
+bot.on(tgMessage('photo'), async (ctx) => {
   if (ctx.session.step === 'awaiting_photo' && ctx.session.adText && ctx.session.categoryId) {
     const mediaGroupId = ctx.message.media_group_id;
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
@@ -360,44 +365,75 @@ bot.on(message('photo'), async (ctx) => {
       return;
     }
 
-    if (mediaGroupId) {
-      if (!photoAccumulators[mediaGroupId]) {
-        photoAccumulators[mediaGroupId] = {
-          photos: [],
-          timeout: null,
-          userId,
-          categoryId: ctx.session.categoryId,
-          adText: ctx.session.adText,
-          ctx,
-        };
-      }
-
-      const accumulator = photoAccumulators[mediaGroupId];
-      if (!accumulator.photos.some(p => p.fileUniqueId === currentPhotoData.fileUniqueId)) {
-        accumulator.photos.push(currentPhotoData);
-        console.log(`📷 Добавлено фото ${accumulator.photos.length} в группу ${mediaGroupId}`);
-      }
-
-      if (accumulator.timeout) clearTimeout(accumulator.timeout);
-      accumulator.timeout = setTimeout(async () => {
-        console.log(`⏰ Таймер сработал для группы ${mediaGroupId}. Собрано фото: ${accumulator.photos.length}`);
-
-        const { photos, adText, categoryId, ctx: originalCtx } = accumulator;
-        delete photoAccumulators[mediaGroupId];
-
-        const fileIds = photos.map(p => p.fileId);
-        await sendToModerationMultiplePhotos(originalCtx, adText, categoryId, fileIds);
-
-        originalCtx.session.step = 'idle';
-        originalCtx.session.adText = undefined;
-        originalCtx.session.categoryId = undefined;
-      }, 1500);
-    } else {
+    // Одиночное фото (не альбом)
+    if (!mediaGroupId) {
       console.log('📷 Получено одно фото');
       await sendToModerationMultiplePhotos(ctx, ctx.session.adText, ctx.session.categoryId, [photo.file_id]);
       ctx.session.step = 'idle';
       ctx.session.adText = undefined;
       ctx.session.categoryId = undefined;
+      return;
+    }
+
+    // Работа с альбомом
+    // Если это первое фото в новом альбоме
+    if (!ctx.session.accumulatorMediaGroupId) {
+      ctx.session.accumulatorMediaGroupId = mediaGroupId;
+      photoAccumulators[mediaGroupId] = {
+        photos: [currentPhotoData],
+        userId,
+        categoryId: ctx.session.categoryId,
+        adText: ctx.session.adText,
+        ctx,
+        timeout: null,
+      };
+      await ctx.reply('📸 Фото добавляются. Нажмите кнопку, когда закончите.', {
+        reply_markup: Markup.inlineKeyboard([
+          Markup.button.callback('✅ Завершить загрузку', 'finish_upload')
+        ]).reply_markup
+      });
+    }
+    // Если это продолжение того же альбома
+    else if (ctx.session.accumulatorMediaGroupId === mediaGroupId) {
+      const accumulator = photoAccumulators[mediaGroupId];
+      if (accumulator) {
+        if (!accumulator.photos.some(p => p.fileUniqueId === currentPhotoData.fileUniqueId)) {
+          accumulator.photos.push(currentPhotoData);
+          console.log(`📷 Добавлено фото ${accumulator.photos.length} в группу ${mediaGroupId}`);
+        }
+      } else {
+        // Восстанавливаем аккумулятор (на случай сбоя)
+        photoAccumulators[mediaGroupId] = {
+          photos: [currentPhotoData],
+          userId,
+          categoryId: ctx.session.categoryId,
+          adText: ctx.session.adText,
+          ctx,
+          timeout: null,
+        };
+      }
+    }
+    // Если пришло фото с другим media_group_id – сбрасываем предыдущий сбор
+    else {
+      const oldGroupId = ctx.session.accumulatorMediaGroupId;
+      if (oldGroupId && photoAccumulators[oldGroupId]) {
+        delete photoAccumulators[oldGroupId];
+      }
+      // Начинаем новый сбор
+      ctx.session.accumulatorMediaGroupId = mediaGroupId;
+      photoAccumulators[mediaGroupId] = {
+        photos: [currentPhotoData],
+        userId,
+        categoryId: ctx.session.categoryId,
+        adText: ctx.session.adText,
+        ctx,
+        timeout: null,
+      };
+      await ctx.reply('📸 Начат новый альбом. Нажмите кнопку, когда закончите.', {
+        reply_markup: Markup.inlineKeyboard([
+          Markup.button.callback('✅ Завершить загрузку', 'finish_upload')
+        ]).reply_markup
+      });
     }
   } else {
     await ctx.reply('Сначала начните добавление через /add');
@@ -413,6 +449,47 @@ bot.on('callback_query', async (ctx) => {
   }
   const data = ctx.callbackQuery.data;
 
+  // ===== Обработка кнопки завершения загрузки =====
+  if (data === 'finish_upload') {
+    const mediaGroupId = ctx.session.accumulatorMediaGroupId;
+    if (!mediaGroupId) {
+      await ctx.answerCbQuery('Нет активной загрузки');
+      return;
+    }
+
+    const accumulator = photoAccumulators[mediaGroupId];
+    if (!accumulator) {
+      await ctx.answerCbQuery('Аккумулятор не найден');
+      ctx.session.accumulatorMediaGroupId = undefined;
+      return;
+    }
+
+    // Проверяем, что это тот же пользователь
+    if (accumulator.userId !== ctx.from?.id) {
+      await ctx.answerCbQuery('Это не ваша загрузка');
+      return;
+    }
+
+    const fileIds = accumulator.photos.map(p => p.fileId);
+    const { adText, categoryId, ctx: originalCtx } = accumulator;
+
+    // Отправляем на модерацию
+    await sendToModerationMultiplePhotos(originalCtx, adText, categoryId, fileIds);
+
+    // Очищаем данные
+    delete photoAccumulators[mediaGroupId];
+    ctx.session.accumulatorMediaGroupId = undefined;
+    ctx.session.step = 'idle';
+    ctx.session.adText = undefined;
+    ctx.session.categoryId = undefined;
+
+    // Редактируем сообщение с кнопкой, чтобы кнопка исчезла
+    await ctx.editMessageText('✅ Загрузка завершена. Объявление отправлено на модерацию.');
+    await ctx.answerCbQuery();
+    return;
+  }
+
+  // ===== Обработка выбора категории =====
   if (data.startsWith('cat_')) {
     const categoryId = parseInt(data.split('_')[1], 10);
     if (isNaN(categoryId)) {
@@ -426,6 +503,7 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
+  // ===== Обработка модерации (approve/reject) =====
   const [action, adIdStr] = data.split('_');
   const adId = parseInt(adIdStr, 10);
   if (isNaN(adId)) {
@@ -433,8 +511,8 @@ bot.on('callback_query', async (ctx) => {
     return;
   }
 
-  const message = ctx.callbackQuery.message;
-  if (!message) {
+  const callbackMessage = ctx.callbackQuery.message; // переименовано, чтобы не конфликтовать с импортом
+  if (!callbackMessage) {
     await ctx.answerCbQuery('Сообщение не найдено');
     return;
   }
@@ -459,8 +537,7 @@ bot.on('callback_query', async (ctx) => {
         }));
         await bot.telegram.sendMediaGroup(channelId, mediaGroup);
       } else {
-        // Для совместимости (если вдруг остались старые объявления с одним фото)
-        // Но photoFileId больше не используется, поэтому отправляем только текст
+        // Если нет фото, отправляем просто текст
         await bot.telegram.sendMessage(channelId, ad.text);
       }
 
@@ -473,7 +550,7 @@ bot.on('callback_query', async (ctx) => {
         console.error('Не удалось уведомить пользователя:', userErr);
       }
 
-      if ('caption' in message) {
+      if ('caption' in callbackMessage) {
         await ctx.editMessageCaption('✅ Одобрено');
       } else {
         await ctx.editMessageText('✅ Одобрено');
@@ -483,11 +560,13 @@ bot.on('callback_query', async (ctx) => {
       await adRepository.save(ad);
 
       try {
-        await ctx.editMessageCaption('❌ Отклонено');
-      } catch (editErr) {
-        try {
+        if ('caption' in callbackMessage) {
+          await ctx.editMessageCaption('❌ Отклонено');
+        } else {
           await ctx.editMessageText('❌ Отклонено');
-        } catch (editErr2) {}
+        }
+      } catch (editErr) {
+        console.error('Не удалось отредактировать сообщение модерации:', editErr);
       }
 
       try {
