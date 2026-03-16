@@ -9,15 +9,13 @@ import * as dotenv from 'dotenv';
 
 dotenv.config();
 
-// Создаём экземпляр бота (только для API, без запуска polling)
 const bot = new Telegraf(process.env.BOT_TOKEN!);
 
 const app = express();
 const PORT: number = parseInt(process.env.PORT || '3000', 10);
 
-// Настройка multer для загрузки одного файла (фото)
 const upload = multer({
-  limits: { fileSize: 5 * 1024 * 1024 }, // ограничение 5 МБ
+  limits: { fileSize: 5 * 1024 * 1024 },
   fileFilter: (req, file, cb) => {
     if (file.mimetype.startsWith('image/')) {
       cb(null, true);
@@ -27,7 +25,6 @@ const upload = multer({
   }
 });
 
-// Middleware для логирования всех входящих запросов
 app.use((req, res, next) => {
   console.log(`📨 ${req.method} ${req.url}`);
   next();
@@ -38,7 +35,6 @@ app.use(cors({
 }));
 app.use(express.json());
 
-// Тестовый маршрут
 app.get('/test', (req, res) => {
   try {
     res.json({ status: 'ok', message: 'API работает' });
@@ -63,7 +59,6 @@ createConnection({
 }).then(() => {
   console.log('📦 API: база данных подключена');
 
-  // Маршрут для получения категорий
   app.get('/api/categories', async (req, res) => {
     try {
       const categoryRepo = getRepository(Category);
@@ -75,7 +70,6 @@ createConnection({
     }
   });
 
-  // Маршрут для получения объявлений
   app.get('/api/ads', async (req, res) => {
     try {
       const { page = 1, limit = 10, categoryId, search } = req.query;
@@ -102,7 +96,7 @@ createConnection({
         ads: ads.map(ad => ({
           id: ad.id,
           text: ad.text,
-          photoFileId: ad.photoFileId,
+          photoFileIds: ad.photoFileIds,
           category: ad.category ? ad.category.name : null,
           createdAt: ad.createdAt,
         })),
@@ -116,60 +110,51 @@ createConnection({
     }
   });
 
-  // ========== НОВЫЙ ЭНДПОИНТ ДЛЯ СОЗДАНИЯ ОБЪЯВЛЕНИЯ ==========
   app.post('/api/createAd', upload.single('photo'), async (req, res) => {
     try {
       const { text, categoryId, userId } = req.body;
       const photoFile = req.file;
 
-      // Проверка обязательных полей
       if (!text || !categoryId || !userId) {
         return res.status(400).json({ error: 'Не хватает данных' });
       }
 
-      // Получаем категорию для названия
       const categoryRepo = getRepository(Category);
       const category = await categoryRepo.findOne({ where: { id: Number(categoryId) } });
       const categoryName = category ? category.name : 'без категории';
 
-      // Создаём запись в БД
       const adRepo = getRepository(Ad);
       const ad = new Ad();
       ad.userId = Number(userId);
       ad.text = text;
       ad.status = 'moderation';
       ad.categoryId = Number(categoryId);
-      ad.photoFileId = undefined; // заполним позже, если есть фото
+      ad.photoFileIds = photoFile ? [] : []; // временно пусто, заполним после отправки
       await adRepo.save(ad);
 
-      // Если есть фото, отправляем его в группу модерации или публикуем сразу
-      let photoFileId: string | undefined;
+      let photoFileIds: string[] = [];
       const modGroupId = process.env.MODERATION_GROUP_ID;
       const channelId = process.env.CHANNEL_ID;
 
       if (photoFile) {
-        // Если модерация включена, отправляем в группу модерации
         if (modGroupId) {
           const caption = `📬 Новое объявление от пользователя (ID: ${userId})\n🏷️ Категория: ${categoryName}\n\n${text}`;
           const keyboard = Markup.inlineKeyboard([
             Markup.button.callback('✅ Одобрить', `approve_${ad.id}`),
             Markup.button.callback('❌ Отклонить', `reject_${ad.id}`)
           ]);
-
           const sent = await bot.telegram.sendPhoto(modGroupId, { source: photoFile.buffer }, {
             caption,
             ...keyboard
           });
-          photoFileId = sent.photo[sent.photo.length - 1].file_id;
+          photoFileIds = [sent.photo[sent.photo.length - 1].file_id];
           ad.moderationMessageId = sent.message_id;
         } else if (channelId) {
-          // Если модерация отключена, публикуем сразу в канал
           const sent = await bot.telegram.sendPhoto(channelId, { source: photoFile.buffer }, { caption: text });
-          photoFileId = sent.photo[sent.photo.length - 1].file_id;
+          photoFileIds = [sent.photo[sent.photo.length - 1].file_id];
           ad.status = 'approved';
         }
       } else {
-        // Без фото – просто отправляем текст в модерацию или публикуем
         if (modGroupId) {
           const caption = `📬 Новое объявление от пользователя (ID: ${userId})\n🏷️ Категория: ${categoryName}\n\n${text}`;
           const keyboard = Markup.inlineKeyboard([
@@ -184,10 +169,7 @@ createConnection({
         }
       }
 
-      // Если есть photoFileId, сохраняем его в БД
-      if (photoFileId) {
-        ad.photoFileId = photoFileId;
-      }
+      ad.photoFileIds = photoFileIds;
       await adRepo.save(ad);
 
       res.json({ success: true, message: 'Объявление отправлено на модерацию' });
@@ -197,7 +179,6 @@ createConnection({
     }
   });
 
-  // Запускаем сервер
   const server = app.listen(PORT, '0.0.0.0', () => {
     console.log(`🌐 API сервер запущен на порту ${PORT}`);
   });

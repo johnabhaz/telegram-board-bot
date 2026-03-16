@@ -12,8 +12,8 @@ export class Ad {
   @Column()
   text!: string;
 
-  @Column({ nullable: true })
-  photoFileId?: string;
+  @Column("simple-array", { nullable: true })
+  photoFileIds?: string[];
 
   @Column({ default: 'moderation' })
   status!: string;
@@ -21,13 +21,12 @@ export class Ad {
   @Column({ nullable: true })
   moderationMessageId?: number;
 
-  // Связь с категорией
   @ManyToOne(() => Category, category => category.ads)
   @JoinColumn({ name: 'categoryId' })
   category!: Category;
 
   @Column({ nullable: true })
-  categoryId?: number; // внешний ключ
+  categoryId?: number;
 
   @CreateDateColumn()
   createdAt!: Date;

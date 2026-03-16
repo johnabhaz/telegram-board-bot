@@ -15,6 +15,17 @@ console.log('ADMIN_ID:', process.env.ADMIN_ID);
 console.log('============================================');
 
 // ========== Интерфейсы ==========
+interface PhotoAccumulator {
+  photos: { fileId: string; fileUniqueId: string }[];
+  timeout: NodeJS.Timeout | null;
+  userId: number;
+  categoryId: number;
+  adText: string;
+  ctx: MyContext;
+}
+
+const photoAccumulators: Record<string, PhotoAccumulator> = {};
+
 interface SessionData {
   step?: 'idle' | 'awaiting_category' | 'awaiting_text' | 'awaiting_photo';
   adText?: string;
@@ -33,21 +44,27 @@ if (!BOT_TOKEN) {
 
 const bot = new Telegraf<MyContext>(BOT_TOKEN);
 
-// Подключаем сессии
 bot.use(session({ defaultSession: (): SessionData => ({ step: 'idle' }) }));
 
-// ========== Функции публикации и модерации ==========
+// ========== Функции ==========
 
-// Прямая публикация (если модерация отключена)
-async function publishAd(ctx: MyContext, text: string, photoFileId?: string) {
+// Прямая публикация
+async function publishAd(ctx: MyContext, text: string, photoFileIds?: string[], singlePhotoId?: string) {
   const channelId = process.env.CHANNEL_ID;
   if (!channelId) {
     await ctx.reply('❌ Ошибка: канал не настроен (CHANNEL_ID отсутствует)');
     return;
   }
   try {
-    if (photoFileId) {
-      await bot.telegram.sendPhoto(channelId, photoFileId, { caption: text });
+    if (photoFileIds && photoFileIds.length > 0) {
+      const mediaGroup = photoFileIds.map((fileId, index) => ({
+        type: 'photo' as const,
+        media: fileId,
+        ...(index === 0 ? { caption: text } : {}),
+      }));
+      await bot.telegram.sendMediaGroup(channelId, mediaGroup);
+    } else if (singlePhotoId) {
+      await bot.telegram.sendPhoto(channelId, singlePhotoId, { caption: text });
     } else {
       await bot.telegram.sendMessage(channelId, text);
     }
@@ -58,7 +75,7 @@ async function publishAd(ctx: MyContext, text: string, photoFileId?: string) {
   }
 }
 
-// Отправка на модерацию (с поддержкой категорий)
+// Отправка на модерацию (одно фото)
 async function sendToModeration(ctx: MyContext, text: string, categoryId: number, photoFileId?: string) {
   const modGroupId = process.env.MODERATION_GROUP_ID;
   const userId = ctx.from?.id;
@@ -67,17 +84,16 @@ async function sendToModeration(ctx: MyContext, text: string, categoryId: number
     return;
   }
 
-  // Если модерация отключена, публикуем сразу и не сохраняем в БД (или сохраняем как approved)
   if (!modGroupId) {
     const adRepository = getRepository(Ad);
     const ad = new Ad();
     ad.userId = userId;
     ad.text = text;
-    ad.photoFileId = photoFileId;
+    ad.photoFileIds = photoFileId ? [photoFileId] : [];
     ad.status = 'approved';
     ad.categoryId = categoryId;
     await adRepository.save(ad);
-    return publishAd(ctx, text, photoFileId);
+    return publishAd(ctx, text, photoFileId ? [photoFileId] : undefined, photoFileId);
   }
 
   const categoryRepository = getRepository(Category);
@@ -88,7 +104,7 @@ async function sendToModeration(ctx: MyContext, text: string, categoryId: number
   const ad = new Ad();
   ad.userId = userId;
   ad.text = text;
-  ad.photoFileId = photoFileId;
+  ad.photoFileIds = photoFileId ? [photoFileId] : [];
   ad.status = 'moderation';
   ad.categoryId = categoryId;
   await adRepository.save(ad);
@@ -112,7 +128,6 @@ async function sendToModeration(ctx: MyContext, text: string, categoryId: number
 
     ad.moderationMessageId = sentMessage.message_id;
     await adRepository.save(ad);
-
     await ctx.reply('📨 Ваше объявление отправлено на модерацию. Мы уведомим вас о результате.');
   } catch (err) {
     console.error('Ошибка отправки в группу модерации:', err);
@@ -120,7 +135,86 @@ async function sendToModeration(ctx: MyContext, text: string, categoryId: number
   }
 }
 
-// ========== Команды бота ==========
+// Отправка на модерацию нескольких фото
+async function sendToModerationMultiplePhotos(
+  ctx: MyContext,
+  text: string,
+  categoryId: number,
+  photoFileIds: string[]
+) {
+  const modGroupId = process.env.MODERATION_GROUP_ID;
+  const userId = ctx.from?.id;
+  if (!userId) {
+    await ctx.reply('Ошибка: не удалось определить ваш ID');
+    return;
+  }
+
+  const categoryRepository = getRepository(Category);
+  const category = await categoryRepository.findOne({ where: { id: categoryId } });
+  const categoryName = category ? category.name : 'без категории';
+
+  const adRepository = getRepository(Ad);
+  const ad = new Ad();
+  ad.userId = userId;
+  ad.text = text;
+  ad.photoFileIds = photoFileIds;
+  ad.status = 'moderation';
+  ad.categoryId = categoryId;
+  await adRepository.save(ad);
+
+  if (!modGroupId) {
+    const channelId = process.env.CHANNEL_ID;
+    if (!channelId) {
+      await ctx.reply('❌ Канал не настроен');
+      return;
+    }
+
+    const mediaGroup = photoFileIds.map((fileId, index) => ({
+      type: 'photo' as const,
+      media: fileId,
+      ...(index === 0 ? { caption: text } : {}),
+    }));
+
+    try {
+      await ctx.telegram.sendMediaGroup(channelId, mediaGroup);
+      ad.status = 'approved';
+      await adRepository.save(ad);
+      await ctx.reply('✅ Ваше объявление опубликовано!');
+    } catch (err) {
+      console.error('Ошибка публикации в канал:', err);
+      await ctx.reply('❌ Не удалось опубликовать объявление.');
+    }
+    return;
+  }
+
+  const mediaGroup = photoFileIds.map((fileId, index) => ({
+    type: 'photo' as const,
+    media: fileId,
+    ...(index === 0
+      ? {
+          caption: `📬 Новое объявление от @${ctx.from?.username || 'пользователь'} (ID: ${userId})\n🏷️ Категория: ${categoryName}\n\n${text}`,
+          ...Markup.inlineKeyboard([
+            Markup.button.callback('✅ Одобрить', `approve_${ad.id}`),
+            Markup.button.callback('❌ Отклонить', `reject_${ad.id}`),
+          ]).reply_markup,
+        }
+      : {}),
+  }));
+
+  try {
+    const sentMessages = await ctx.telegram.sendMediaGroup(modGroupId, mediaGroup);
+    if (sentMessages.length > 0) {
+      ad.moderationMessageId = sentMessages[0].message_id;
+      await adRepository.save(ad);
+    }
+    await ctx.reply('📨 Ваше объявление отправлено на модерацию. Мы уведомим вас о результате.');
+  } catch (err) {
+    console.error('Ошибка отправки в группу модерации:', err);
+    await ctx.reply('❌ Не удалось отправить объявление на модерацию. Попробуйте позже.');
+  }
+}
+
+// ========== Команды ==========
 
 bot.start((ctx) => {
   ctx.reply('Бот работает! Используйте /add для подачи объявления.');
@@ -159,9 +253,10 @@ bot.command('myads', async (ctx) => {
       const status = statusEmoji[ad.status as keyof typeof statusEmoji] || '❓ Неизвестно';
       const shortText = ad.text.length > 50 ? ad.text.substring(0, 47) + '…' : ad.text;
       const categoryName = ad.category ? ad.category.name : 'Без категории';
+      const photoCount = ad.photoFileIds ? ad.photoFileIds.length : 0;
 
       message += `${i + 1}. ${status}\n   📝 ${shortText}\n   🏷️ Категория: ${categoryName}\n   🕒 ${date}\n`;
-      if (ad.photoFileId) message += `   📷 Есть фото\n`;
+      message += `   📷 Фото: ${photoCount}\n`;
       message += '\n';
     }
 
@@ -255,17 +350,61 @@ bot.on(message('text'), async (ctx) => {
 
 bot.on(message('photo'), async (ctx) => {
   if (ctx.session.step === 'awaiting_photo' && ctx.session.adText && ctx.session.categoryId) {
+    const mediaGroupId = ctx.message.media_group_id;
     const photo = ctx.message.photo[ctx.message.photo.length - 1];
-    await sendToModeration(ctx, ctx.session.adText, ctx.session.categoryId, photo.file_id);
-    ctx.session.step = 'idle';
-    ctx.session.adText = undefined;
-    ctx.session.categoryId = undefined;
+    const userId = ctx.from?.id;
+    const currentPhotoData = { fileId: photo.file_id, fileUniqueId: photo.file_unique_id };
+
+    if (!userId) {
+      await ctx.reply('Ошибка идентификации пользователя.');
+      return;
+    }
+
+    if (mediaGroupId) {
+      if (!photoAccumulators[mediaGroupId]) {
+        photoAccumulators[mediaGroupId] = {
+          photos: [],
+          timeout: null,
+          userId,
+          categoryId: ctx.session.categoryId,
+          adText: ctx.session.adText,
+          ctx,
+        };
+      }
+
+      const accumulator = photoAccumulators[mediaGroupId];
+      if (!accumulator.photos.some(p => p.fileUniqueId === currentPhotoData.fileUniqueId)) {
+        accumulator.photos.push(currentPhotoData);
+        console.log(`📷 Добавлено фото ${accumulator.photos.length} в группу ${mediaGroupId}`);
+      }
+
+      if (accumulator.timeout) clearTimeout(accumulator.timeout);
+      accumulator.timeout = setTimeout(async () => {
+        console.log(`⏰ Таймер сработал для группы ${mediaGroupId}. Собрано фото: ${accumulator.photos.length}`);
+
+        const { photos, adText, categoryId, ctx: originalCtx } = accumulator;
+        delete photoAccumulators[mediaGroupId];
+
+        const fileIds = photos.map(p => p.fileId);
+        await sendToModerationMultiplePhotos(originalCtx, adText, categoryId, fileIds);
+
+        originalCtx.session.step = 'idle';
+        originalCtx.session.adText = undefined;
+        originalCtx.session.categoryId = undefined;
+      }, 1500);
+    } else {
+      console.log('📷 Получено одно фото');
+      await sendToModerationMultiplePhotos(ctx, ctx.session.adText, ctx.session.categoryId, [photo.file_id]);
+      ctx.session.step = 'idle';
+      ctx.session.adText = undefined;
+      ctx.session.categoryId = undefined;
+    }
   } else {
     await ctx.reply('Сначала начните добавление через /add');
   }
 });
 
-// ========== Обработка нажатий на кнопки (категории и модерация) ==========
+// ========== Обработка нажатий ==========
 
 bot.on('callback_query', async (ctx) => {
   if (!('data' in ctx.callbackQuery)) {
@@ -274,23 +413,19 @@ bot.on('callback_query', async (ctx) => {
   }
   const data = ctx.callbackQuery.data;
 
-  // Обработка выбора категории
   if (data.startsWith('cat_')) {
     const categoryId = parseInt(data.split('_')[1], 10);
     if (isNaN(categoryId)) {
       await ctx.answerCbQuery('Ошибка: некорректная категория');
       return;
     }
-
     ctx.session.categoryId = categoryId;
     ctx.session.step = 'awaiting_text';
-
     await ctx.editMessageText('✅ Категория выбрана. Теперь отправьте текст объявления:');
     await ctx.answerCbQuery();
     return;
   }
 
-  // Обработка модерации (approve/reject)
   const [action, adIdStr] = data.split('_');
   const adId = parseInt(adIdStr, 10);
   if (isNaN(adId)) {
@@ -316,16 +451,27 @@ bot.on('callback_query', async (ctx) => {
       const channelId = process.env.CHANNEL_ID;
       if (!channelId) throw new Error('CHANNEL_ID не задан');
 
-      if (ad.photoFileId) {
-        await bot.telegram.sendPhoto(channelId, ad.photoFileId, { caption: ad.text });
+      if (ad.photoFileIds && ad.photoFileIds.length > 0) {
+        const mediaGroup = ad.photoFileIds.map((fileId, index) => ({
+          type: 'photo' as const,
+          media: fileId,
+          ...(index === 0 ? { caption: ad.text } : {})
+        }));
+        await bot.telegram.sendMediaGroup(channelId, mediaGroup);
       } else {
+        // Для совместимости (если вдруг остались старые объявления с одним фото)
+        // Но photoFileId больше не используется, поэтому отправляем только текст
         await bot.telegram.sendMessage(channelId, ad.text);
       }
 
       ad.status = 'approved';
       await adRepository.save(ad);
 
-      await bot.telegram.sendMessage(ad.userId, '✅ Ваше объявление одобрено и опубликовано!');
+      try {
+        await bot.telegram.sendMessage(ad.userId, '✅ Ваше объявление одобрено и опубликовано!');
+      } catch (userErr) {
+        console.error('Не удалось уведомить пользователя:', userErr);
+      }
 
       if ('caption' in message) {
         await ctx.editMessageCaption('✅ Одобрено');
@@ -336,12 +482,18 @@ bot.on('callback_query', async (ctx) => {
       ad.status = 'rejected';
       await adRepository.save(ad);
 
-      await bot.telegram.sendMessage(ad.userId, '❌ Ваше объявление отклонено модератором.');
-
-      if ('caption' in message) {
+      try {
         await ctx.editMessageCaption('❌ Отклонено');
-      } else {
-        await ctx.editMessageText('❌ Отклонено');
+      } catch (editErr) {
+        try {
+          await ctx.editMessageText('❌ Отклонено');
+        } catch (editErr2) {}
+      }
+
+      try {
+        await bot.telegram.sendMessage(ad.userId, '❌ Ваше объявление отклонено модератором.');
+      } catch (userErr) {
+        console.error('Не удалось уведомить пользователя:', userErr);
       }
     }
 
@@ -352,69 +504,55 @@ bot.on('callback_query', async (ctx) => {
   }
 });
 
-// ========== НОВЫЙ ОБРАБОТЧИК: данные из WebApp ==========
+// ========== Данные из WebApp ==========
 
 bot.on('message', async (ctx) => {
-  // Проверяем наличие поля web_app_data через оператор in
   if (ctx.message && 'web_app_data' in ctx.message) {
-    const webAppData = (ctx.message as any).web_app_data; // или использовать any
+    const webAppData = (ctx.message as any).web_app_data;
     const data = JSON.parse(webAppData.data);
-    
-    // Обработка просмотра объявления
+
     if (data.action === 'viewAd') {
       const adId = data.adId;
       const adRepository = getRepository(Ad);
-      const ad = await adRepository.findOne({ 
-        where: { id: adId },
-        relations: ['category'] 
-      });
-      
+      const ad = await adRepository.findOne({ where: { id: adId }, relations: ['category'] });
       if (!ad) {
         await ctx.reply('❌ Объявление не найдено');
         return;
       }
-      
-      let message = `📌 **Объявление #${ad.id}**\n\n${ad.text}`;
-      if (ad.category) message += `\n🏷️ Категория: ${ad.category.name}`;
-      message += `\n📅 ${new Date(ad.createdAt).toLocaleString('ru-RU')}`;
-      message += `\n📊 Статус: ${
+      let msg = `📌 **Объявление #${ad.id}**\n\n${ad.text}`;
+      if (ad.category) msg += `\n🏷️ Категория: ${ad.category.name}`;
+      msg += `\n📅 ${new Date(ad.createdAt).toLocaleString('ru-RU')}`;
+      msg += `\n📊 Статус: ${
         ad.status === 'approved' ? '✅ Опубликовано' : 
         ad.status === 'moderation' ? '⏳ На модерации' : 
         ad.status === 'rejected' ? '❌ Отклонено' : '❓ Неизвестно'
       }`;
-      
-      if (ad.photoFileId) {
-        await ctx.replyWithPhoto(ad.photoFileId, { caption: message, parse_mode: 'Markdown' });
+      if (ad.photoFileIds && ad.photoFileIds.length > 0) {
+        await ctx.replyWithPhoto(ad.photoFileIds[0], { caption: msg, parse_mode: 'Markdown' });
       } else {
-        await ctx.reply(message, { parse_mode: 'Markdown' });
+        await ctx.reply(msg, { parse_mode: 'Markdown' });
       }
-    } 
-    // Обработка создания объявления
-    else if (data.action === 'createAd') {
+    } else if (data.action === 'createAd') {
       const { categoryId, text } = data;
-      
       if (!categoryId || !text) {
         await ctx.reply('❌ Ошибка: не все данные получены');
         return;
       }
-      
-      // Сохраняем в сессию, переходим к шагу ожидания фото
       ctx.session.categoryId = categoryId;
       ctx.session.adText = text;
       ctx.session.step = 'awaiting_photo';
-      
       await ctx.reply('✅ Текст объявления получен. Теперь отправьте фото (или напишите "пропустить")');
     }
   }
 });
 
-// ========== Подключение к БД и ЗАПУСК ==========
+// ========== Подключение к БД и запуск ==========
 
 createConnection({
   type: 'sqlite',
   database: 'database.sqlite',
   entities: [Ad, Category],
-  synchronize: true,  // оставляем true – бот создаёт таблицы
+  synchronize: true,
   logging: false,
   extra: {
     pragma: {
@@ -445,6 +583,6 @@ createConnection({
   })
   .catch(error => console.log('Ошибка БД:', error));
 
-// ========== Корректное завершение ==========
+// ========== Завершение ==========
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
